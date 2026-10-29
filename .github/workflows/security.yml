@@ -1,0 +1,72 @@
+name: security-scan
+
+on:
+  push:
+    branches: ['scan/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  codeql:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { language: c-cpp,   build-mode: manual }
+          - { language: python,  build-mode: none }
+          - { language: actions, build-mode: none }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+      - if: matrix.language == 'c-cpp'
+        name: Build the kernel module for CodeQL
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -qy linux-headers-$(uname -r) build-essential
+          make -C kernel/gpu_unlock KDIR=/lib/modules/$(uname -r)/build
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
+
+  semgrep:
+    runs-on: ubuntu-24.04
+    container: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v5
+      - run: semgrep scan --metrics=off --config p/c --config p/python --config p/github-actions --config p/secrets --sarif --output semgrep.sarif || true
+      - uses: github/codeql-action/upload-sarif@v4
+        with: { sarif_file: semgrep.sarif, category: semgrep }
+
+  bandit-flawfinder:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: pip install --quiet "bandit[sarif]" flawfinder
+      - run: bandit -r . -f sarif -o bandit.sarif --exit-zero
+      - run: flawfinder --sarif kernel/ > flawfinder.sarif
+      - uses: github/codeql-action/upload-sarif@v4
+        with: { sarif_file: bandit.sarif, category: bandit }
+      - uses: github/codeql-action/upload-sarif@v4
+        with: { sarif_file: flawfinder.sarif, category: flawfinder }
+
+  kernel-checkers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update -q && sudo apt-get install -qy linux-headers-$(uname -r) build-essential sparse
+      - name: sparse
+        run: make -C /lib/modules/$(uname -r)/build M=$PWD/kernel/gpu_unlock C=2 modules 2>&1 | tee sparse.log
+      - name: gcc -fanalyzer
+        run: |
+          make -C kernel/gpu_unlock clean
+          make -C /lib/modules/$(uname -r)/build M=$PWD/kernel/gpu_unlock KCFLAGS=-fanalyzer modules 2>&1 | tee analyzer.log
+      - uses: actions/upload-artifact@v4
+        with: { name: kernel-checker-logs, path: '*.log' }
